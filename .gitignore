@@ -1,0 +1,61 @@
+# =============================================================================
+# wasac_analytics — .gitignore
+# =============================================================================
+
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env.local
+.dev_env
+.prod_env
+*.env.local
+~/.airflow
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Web UI runtime files ──────────────────────────────────────────────────────
+web_ui/webui.db
+
+# ── Data files ────────────────────────────────────────────────────────────────
+# Ignore the whole data_dumps tree except directory skeleton placeholders
+data_dumps/**
+!data_dumps/
+!data_dumps/incoming/
+!data_dumps/incoming/.gitkeep
+!data_dumps/archive/
+!data_dumps/archive/.gitkeep
+*.csv
+*.parquet
+
+# ── Generated at runtime by the Web UI — never commit these ──────────────────
+# Config JSONs, DAG .py files, SQL files (all live in customer subfolders)
+dags/config/*/
+dags/sql/*/
+dags/etl/*/
+
+# ── Data dump folders (incoming files, archives, processed data) ──────────────
+# (covered by data_dumps/** above; skeleton .gitkeep files are explicitly un-ignored)
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE files ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# .env is committed as a template (safe — contains only ${VAR} placeholders)
+# Real values live in ~/.airflow on each server

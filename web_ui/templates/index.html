@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ETL Manager</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}">&#9654; ETL Manager</a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>Dashboard</h1>
+    </div>
+
+    <div class="form-grid" style="grid-template-columns:repeat(3,1fr);gap:16px;">
+      <div class="card" style="text-align:center;padding:28px 16px;">
+        <div style="font-size:32px;font-weight:700;color:#1e70bf;">{{ job_count }}</div>
+        <div style="color:#6b7a90;font-size:12px;margin-top:4px;">ETL Jobs</div>
+        <a class="btn btn-primary" href="{{ url_for('jobs') }}" style="margin-top:14px;">View Jobs</a>
+      </div>
+
+      <div class="card" style="text-align:center;padding:28px 16px;">
+        <div style="font-size:32px;font-weight:700;color:#1e70bf;">{{ user_count if user_count is defined else '—' }}</div>
+        <div style="color:#6b7a90;font-size:12px;margin-top:4px;">Users</div>
+        {% if user[3] %}
+        <a class="btn btn-secondary" href="{{ url_for('users') }}" style="margin-top:14px;">Manage</a>
+        {% endif %}
+      </div>
+
+      <div class="card" style="text-align:center;padding:28px 16px;">
+        <div style="font-size:32px;font-weight:700;color:#28a745;">&#10003;</div>
+        <div style="color:#6b7a90;font-size:12px;margin-top:4px;">System OK</div>
+        <a class="btn btn-secondary" href="{{ url_for('new_job') }}" style="margin-top:14px;">+ New Job</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">Developed by <a href="https://cenfri.org" target="_blank">Cenfri.org</a> &mdash; <a href="mailto:datateam@cenfri.org">datateam@cenfri.org</a></div>
+</div>
+</body>
+</html>

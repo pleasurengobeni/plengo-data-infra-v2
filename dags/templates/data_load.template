@@ -1,0 +1,937 @@
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+import pandas as pd
+from sqlalchemy import create_engine, text
+from sqlalchemy.types import BigInteger, Boolean, Date, DateTime, Float, Integer, Text
+
+modules_path = Variable.get(
+    "modules_path", default_var=os.path.join(os.getcwd(), "dags", "modules")
+)
+if modules_path not in sys.path:
+    sys.path.insert(1, modules_path)
+
+from modules.import_modules import parse_sql_file
+from modules.utils import get_hook, read_json_file
+
+
+dag_name = "<dag_name>"
+
+
+def clean_string(input_string):
+    return re.sub(r"[^a-zA-Z0-9\-_.]", "_", input_string)
+
+
+def load_config(dag_name):
+    import glob
+    config_path = Variable.get(
+        "config_path", default_var=os.path.join(os.getcwd(), "dags", "config")
+    )
+    # Search recursively: supports both legacy flat layout and new <conn_id>/<conn_id>_<dag>.json layout
+    pattern = os.path.join(config_path, "**", f"*{dag_name.lower()}*.json")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        raise FileNotFoundError(
+            f"Config file for '{dag_name}' not found under '{config_path}'"
+        )
+    config = read_json_file(matches[0])
+    env = Variable.get("environment", "dev")
+    if "source" in config and env in config.get("source", {}):
+        source_cfg = config["source"][env]
+        target_cfg = config["target"][env]
+    else:
+        source_cfg = config["source"]
+        target_cfg = config["target"]
+
+    source_schema = source_cfg.get("source_table_schema") or source_cfg.get("source_schema")
+    source_table = source_cfg.get("source_table_name") or source_cfg.get("source_table")
+
+    target_db = target_cfg.get("target_db") or target_cfg.get("target_schema")
+    target_schema = target_cfg.get("target_table_schema") or target_cfg.get("target_schema")
+    target_table = target_cfg.get("target_table_name") or target_cfg.get("target_table")
+
+    return {
+        "dag_id": config.get("dag_id", f"ETL_{dag_name}"),
+        "schedule_interval": config.get("schedule_interval"),
+        "start_date": config.get("start_date", "2023-01-01"),
+        "source": {
+            "source_db_conn_id": source_cfg.get("source_db_conn_id"),
+            "db_type": source_cfg.get("db_type"),
+            "source_table_schema": source_schema,
+            "source_table_name": source_table,
+            "incremental_column": source_cfg.get("incremental_column"),
+            "incremental_column_datatype": source_cfg.get("incremental_column_datatype"),
+            "limit": source_cfg.get("limit"),
+            "full_load": source_cfg.get("full_load", False),
+            "batch_size": source_cfg.get("batch_size") if source_cfg.get("batch_size") is not None else config.get("batch_size", 0),
+        },
+        "target": {
+            "target_db_conn_id": target_cfg.get("target_db_conn_id"),
+            "target_db": target_db,
+            "target_table_schema": target_schema,
+            "target_table_name": target_table,
+            "incremental_column": target_cfg.get("incremental_column"),
+            "db_type": target_cfg.get("db_type", "postgresql"),
+        },
+        "read_chunk_size": config.get("read_chunk_size", 50000),
+        "transformations": config.get("transformations", []),
+        "rename_columns": config.get("rename_columns", []),
+        "replace_values": config.get("replace_values", []),
+        "target_ddl": config.get("target_ddl"),
+        # sql_file comes from the active env's source block so dev/prod get different queries
+        "sql_file": source_cfg.get("sql_file") or config.get("sql_file"),
+        "write_mode": config.get("write_mode", "append"),
+        "tags": config.get("tags", ["ETL", "PYTHON"]),
+    }
+
+
+CONFIG = load_config(dag_name)
+SQL_BASE = Variable.get("sql_path", default_var=os.path.join(os.getcwd(), "dags", "sql"))
+
+def _resolve_sql_path(sql_base, dag_name, sql_file=None):
+    import glob
+    # 1. Genuine absolute path — use as-is
+    if sql_file and os.path.isabs(sql_file):
+        return sql_file
+    # 2. Relative path (e.g. conn_id/file.sql) — always join with sql_base
+    if sql_file:
+        return os.path.join(sql_base, sql_file)
+    # 3. No sql_file in config — glob search for any matching file across subdirs
+    matches = glob.glob(os.path.join(sql_base, "**", f"*{dag_name.lower()}*.sql"), recursive=True)
+    if matches:
+        return matches[0]
+    # 4. Last resort fallback
+    return os.path.join(sql_base, f"{dag_name.lower()}.sql")
+
+SQL_PATH = _resolve_sql_path(SQL_BASE, dag_name, CONFIG.get("sql_file"))
+
+
+def ensure_schema_exists(schema_name):
+    hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine = create_engine(hook.get_uri())
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema_name}"))
+
+
+def _ensure_pipeline_metadata_columns(schema: str, table: str):
+    """ALTER TABLE to add pipeline metadata columns if they don't exist yet.
+    Safe to call every run — IF NOT EXISTS is idempotent."""
+    hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine = create_engine(hook.get_uri())
+    cols = [
+        ("_pipeline_inserted_at", "TIMESTAMP"),
+        ("_pipeline_run_id",      "TEXT"),
+        ("_source_system",        "TEXT"),
+        ("_loaded_at",            "TIMESTAMP"),
+        ("_row_checksum",         "TEXT"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type in cols:
+            conn.execute(text(
+                f"ALTER TABLE {schema}.{table} "
+                f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+            ))
+
+
+def pandas_dtype_to_sql(dtype):
+    if pd.api.types.is_integer_dtype(dtype):
+        return BigInteger()
+    if pd.api.types.is_float_dtype(dtype):
+        return Float()
+    if pd.api.types.is_bool_dtype(dtype):
+        return Boolean()
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return DateTime()
+    # dtype.kind == 'M' covers all datetime64 variants; numpy date scalars have kind == 'O'
+    # Use hasattr guard for numpy dtypes that expose .type
+    if hasattr(dtype, 'type') and issubclass(dtype.type, __import__('datetime').date):
+        return Date()
+    return Text()
+
+
+def build_sqlalchemy_dtypes(df):
+    return {col: pandas_dtype_to_sql(dtype) for col, dtype in df.dtypes.items()}
+
+
+def _hwm_expressions(incremental_column, incremental_column_datatype, last_loaded):
+    """
+    Return (order_expr, where_clause) for the given incremental column.
+    order_expr  : SQL expression to cast the column to a comparable type
+    where_clause: SQL predicate filtering rows strictly AFTER last_loaded,
+                  or None when last_loaded is None (full-load / first-run).
+    """
+    datatype = (incremental_column_datatype or "").lower()
+    is_numeric = datatype in ("int", "bigint")
+    if is_numeric:
+        order_expr   = f"CAST({incremental_column} AS BIGINT)"
+        where_clause = f"{order_expr} > {int(last_loaded)}" if last_loaded is not None else None
+    else:
+        order_expr   = f"CAST({incremental_column} AS TIMESTAMP)"
+        where_clause = f"{order_expr} > '{last_loaded}'" if last_loaded is not None else None
+    return order_expr, where_clause
+
+
+def build_batch_temp_sql(base_sql, incremental_column, last_loaded, batch_size, incremental_column_datatype):
+    """
+    Returns the SQL to populate _etl_batch_tmp.
+
+    last_loaded=None means either full_load=True or first incremental run —
+    in both cases load all source rows (no WHERE filter), ordered by HWM if
+    incremental_column is set so subsequent runs can pick up from the right place.
+    """
+    if not incremental_column:
+        # No incremental column configured — always a straight full load
+        return base_sql
+
+    order_expr, _ = _hwm_expressions(incremental_column, incremental_column_datatype, None)
+
+    if last_loaded is None:
+        # First run or full_load=True: no HWM filter, load everything ordered
+        if batch_size and batch_size > 0:
+            sql = (
+                f"SELECT * FROM ({base_sql}) _src "
+                f"ORDER BY {order_expr} "
+                f"LIMIT {batch_size}"
+            )
+        else:
+            sql = (
+                f"SELECT * FROM ({base_sql}) _src "
+                f"ORDER BY {order_expr}"
+            )
+    else:
+        _, where_clause = _hwm_expressions(incremental_column, incremental_column_datatype, last_loaded)
+        if batch_size and batch_size > 0:
+            sql = (
+                f"SELECT * FROM ({base_sql}) _src "
+                f"WHERE {where_clause} "
+                f"ORDER BY {order_expr} "
+                f"LIMIT {batch_size}"
+            )
+        else:
+            sql = (
+                f"SELECT * FROM ({base_sql}) _src "
+                f"WHERE {where_clause} "
+                f"ORDER BY {order_expr}"
+            )
+
+    logging.info("Batch temp SQL: %s", sql)
+    return sql
+
+
+def build_final_select_sql(incremental_column, incremental_column_datatype):
+    """
+    Returns the SQL to read the final boundary-inclusive result from the temp
+    table _etl_batch_tmp.
+
+    Why boundary-inclusive:
+      The batch LIMIT may have cut off mid-tie (multiple rows share the exact
+      same HWM value as the last row in the batch).  We rejoin the source for
+      only those tied rows using the MAX already stored in the temp table —
+      one cheap indexed lookup, not a second full scan of base_sql.
+
+    Final ORDER BY ensures Pandas/the loader always sees rows in ascending
+    HWM order, which is required for get_last_loaded_value() to advance
+    the watermark correctly on subsequent runs.
+    """
+    if not incremental_column:
+        return "SELECT * FROM _etl_batch_tmp"
+
+    order_expr, _ = _hwm_expressions(incremental_column, incremental_column_datatype, None)
+
+    sql = (
+        f"SELECT * FROM _etl_batch_tmp "
+        f"ORDER BY {order_expr}"
+    )
+    logging.info("Final select SQL: %s", sql)
+    return sql
+
+
+def get_last_loaded_value():
+    """
+    Returns the current HWM (high-water mark) from the target table, or None
+    if this is a full load run.
+
+    Rules (driven entirely by config, never defaulting silently):
+      - full_load=True   : always return None — caller skips HWM filter
+      - incremental_column not set : return None — no filter possible
+      - target empty / missing     : return None — first incremental run,
+                                     caller will load everything from source
+                                     (no silent 1900 default — that is a full
+                                     load disguised as incremental)
+    """
+    if CONFIG["source"].get("full_load", False):
+        logging.info("get_last_loaded_value: full_load=True — skipping HWM query.")
+        return None
+
+    incremental_column = CONFIG["source"]["incremental_column"]
+    if not incremental_column:
+        return None
+
+    target_hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+    schema = CONFIG["target"]["target_table_schema"]
+    table  = CONFIG["target"]["target_table_name"]
+    query  = f"SELECT MAX({incremental_column}) AS max_val FROM {schema}.{table}"
+    try:
+        result = target_hook.get_first(query)
+        value  = result[0] if result else None
+        if value is None:
+            # Table exists but is empty — first incremental run, no HWM yet.
+            # Return None so build_batch_temp_sql loads all source rows.
+            logging.info(
+                "get_last_loaded_value: %s.%s is empty — first incremental load.",
+                schema, table,
+            )
+        return value
+    except Exception as e:
+        # Table does not exist yet (create_target just ran).
+        logging.warning(
+            "get_last_loaded_value: could not read HWM from %s.%s (%s) — first load.",
+            schema, table, e,
+        )
+        return None
+
+
+default_args = {
+    "owner": "airflow",
+    "start_date": datetime.strptime(CONFIG["start_date"], "%Y-%m-%d"),
+    "retries": 3,
+    "retry_delay": timedelta(seconds=5),
+    "depends_on_past": False,
+}
+
+dag = DAG(
+    dag_id=f"ETL_{clean_string(CONFIG['target']['target_db_conn_id'] or 'conn')}_{clean_string(CONFIG['dag_id'])}",
+    default_args=default_args,
+    schedule_interval=CONFIG["schedule_interval"],
+    tags=CONFIG["tags"],
+    catchup=False,
+    concurrency=4,
+    max_active_runs=1,
+)
+
+start = EmptyOperator(task_id="start", dag=dag)
+end = EmptyOperator(task_id="end", dag=dag, trigger_rule=TriggerRule.NONE_FAILED)
+
+
+def extract_data(**kwargs):
+    """
+    Extract the next batch from the source using a temp table strategy:
+
+      1. Build the batch SQL (filtered by HWM, ordered ASC, limited if batched)
+      2. CREATE TEMP TABLE _etl_batch_tmp AS (batch SQL)   ← single source scan
+      3. CREATE INDEX on _etl_batch_tmp(HWM col)           ← cheap, in-memory
+      4. SELECT * FROM _etl_batch_tmp ORDER BY HWM         ← ordered final read
+
+    This avoids scanning base_sql twice (old UNION approach) and guarantees
+    the result is always ordered by HWM so watermark advancement is correct.
+    """
+    incr_col      = CONFIG["source"]["incremental_column"]
+    incr_datatype = CONFIG["source"]["incremental_column_datatype"]
+    batch_size    = CONFIG["source"].get("batch_size") or 0
+
+    source_hook   = get_hook(CONFIG["source"]["source_db_conn_id"])
+    source_engine = create_engine(source_hook.get_uri())
+    base_sql      = parse_sql_file(SQL_PATH)
+    last_loaded   = get_last_loaded_value()
+
+    batch_sql  = build_batch_temp_sql(base_sql, incr_col, last_loaded, batch_size, incr_datatype)
+    final_sql  = build_final_select_sql(incr_col, incr_datatype)
+
+    data_dump = Variable.get(
+        "data_dump", default_var=os.path.join(os.getcwd(), "data_dumps")
+    )
+    target_conn_id = clean_string(CONFIG["target"]["target_db_conn_id"])
+    staging_path = (
+        f"{data_dump}/csv/{target_conn_id}/{dag_name}/{kwargs['run_id']}/raw.csv"
+    )
+    os.makedirs(os.path.dirname(staging_path), exist_ok=True)
+
+    row_count = 0
+    columns   = None
+    chunk_size = CONFIG.get("read_chunk_size", 50000)
+
+    # Use a single connection so the TEMP TABLE is visible to the SELECT
+    with source_engine.connect() as conn:
+        # 1. Populate temp table — one scan of source, filtered+sorted+limited
+        conn.execute(text(f"CREATE TEMP TABLE _etl_batch_tmp AS ({batch_sql})"))
+        logging.info("Temp table _etl_batch_tmp created.")
+
+        # 2. Index the HWM column for fast MAX() lookup and ordered reads
+        if incr_col:
+            order_expr, _ = _hwm_expressions(incr_col, incr_datatype, None)
+            conn.execute(text(
+                f"CREATE INDEX ON _etl_batch_tmp ({order_expr})"
+            ))
+            logging.info("Index created on _etl_batch_tmp(%s).", order_expr)
+
+        # 3. Read the final ordered result in chunks (stays in same session)
+        first = True
+        for chunk in pd.read_sql(text(final_sql), conn, chunksize=chunk_size):
+            if chunk.empty:
+                continue
+            if columns is None:
+                columns = chunk.columns.tolist()
+            chunk.to_csv(staging_path, index=False, mode="w" if first else "a", header=first)
+            row_count += len(chunk)
+            first = False
+        # Temp table is automatically dropped when the connection closes
+
+    if row_count == 0:
+        return {"path": None, "schema": None, "row_count": 0, "has_rows": False}
+
+    logging.info("Extracted %d rows → %s", row_count, staging_path)
+    return {
+        "path": staging_path,
+        "schema": json.dumps({"columns": columns or []}),
+        "row_count": int(row_count),
+        "has_rows": True,
+    }
+
+
+def branch_on_rows(**kwargs):
+    payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+    if "has_rows" in payload:
+        return "process_data" if payload.get("has_rows") else "no_new_rows"
+    return "process_data" if payload.get("row_count", 0) > 0 else "no_new_rows"
+
+
+def apply_select_expr(df, select_expr):
+    if not select_expr or select_expr == ["*"]:
+        return df
+
+    selected_cols = []
+    rename_map = {}
+    for expr in select_expr:
+        expr_str = str(expr).strip()
+        if expr_str == "*":
+            for col in df.columns:
+                if col not in selected_cols:
+                    selected_cols.append(col)
+            continue
+        parts = re.split(r"\s+as\s+", expr_str, flags=re.IGNORECASE)
+        col_name = parts[0].strip()
+        alias = parts[1].strip() if len(parts) > 1 else None
+        if col_name in df.columns:
+            selected_cols.append(col_name)
+            if alias and alias != col_name:
+                rename_map[col_name] = alias
+
+    if selected_cols:
+        df = df[selected_cols]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def process_data(**kwargs):
+    payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+    if not payload.get("path"):
+        return {"path": None, "schema": None}
+
+    chunk_size = CONFIG.get("read_chunk_size")
+    chunks = pd.read_csv(payload["path"], chunksize=chunk_size)
+
+    data_dump = Variable.get(
+        "data_dump", default_var=os.path.join(os.getcwd(), "data_dumps")
+    )
+    target_conn_id = clean_string(CONFIG["target"]["target_db_conn_id"])
+    processed_path = (
+        f"{data_dump}/csv/{target_conn_id}/{dag_name}/{kwargs['run_id']}/processed.csv"
+    )
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+
+    first = True
+    columns = None
+    for chunk in chunks:
+        if chunk.empty:
+            continue
+        for transform in CONFIG.get("transformations", []):
+            chunk = apply_select_expr(chunk, transform.get("select_expr", ["*"]))
+
+        for rename in CONFIG.get("rename_columns", []):
+            if rename.get("from") in chunk.columns:
+                chunk = chunk.rename(columns={rename["from"]: rename["to"]})
+
+        for replace in CONFIG.get("replace_values", []):
+            columns_to_replace = replace.get("columns")
+            if columns_to_replace:
+                chunk.loc[:, columns_to_replace] = chunk.loc[:, columns_to_replace].replace(
+                    replace["old"], replace["new"]
+                )
+            else:
+                chunk = chunk.replace(replace["old"], replace["new"])
+
+        if columns is None:
+            columns = chunk.columns.tolist()
+        mode = "w" if first else "a"
+        chunk.to_csv(processed_path, index=False, mode=mode, header=first)
+        first = False
+
+    return {"path": processed_path, "schema": json.dumps({"columns": columns or []})}
+
+
+def create_target(**kwargs):
+    if CONFIG.get("target_ddl"):
+        hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+        hook.run(CONFIG["target_ddl"])
+        # Still ensure metadata columns even on custom DDL paths
+        _ensure_pipeline_metadata_columns(
+            CONFIG["target"]["target_table_schema"],
+            CONFIG["target"]["target_table_name"],
+        )
+        return
+
+    schema = CONFIG["target"]["target_table_schema"]
+    table  = CONFIG["target"]["target_table_name"]
+    ensure_schema_exists(schema)
+
+    target_hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    target_engine = create_engine(target_hook.get_uri())
+
+    # Check if the table already exists
+    from sqlalchemy import inspect as _sa_inspect
+    inspector = _sa_inspect(target_engine)
+    table_exists = inspector.has_table(table, schema=schema)
+
+    if table_exists:
+        # Table pre-exists: ensure metadata columns are present via ALTER TABLE
+        logging.info("create_target: %s.%s already exists — ensuring metadata columns.", schema, table)
+        _ensure_pipeline_metadata_columns(schema, table)
+    else:
+        # Brand-new table: create it with metadata columns baked in from the start.
+        # We derive column types from the source and append the metadata columns.
+        logging.info("create_target: %s.%s does not exist — creating with metadata columns.", schema, table)
+        with target_engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.{table} (
+                    _pipeline_inserted_at  TIMESTAMP,
+                    _pipeline_run_id       TEXT,
+                    _source_system         TEXT,
+                    _loaded_at             TIMESTAMP,
+                    _row_checksum          TEXT
+                )
+            """))
+        logging.info(
+            "create_target: %s.%s created with metadata columns. "
+            "load_data will ALTER TABLE to add source columns on first to_sql.",
+            schema, table
+        )
+
+
+def load_data(**kwargs):
+    payload = kwargs["ti"].xcom_pull(task_ids="process_data") or {}
+    if not payload.get("path") or not os.path.exists(payload.get("path", "")):
+        raw_payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+        if not raw_payload.get("path") or not os.path.exists(raw_payload.get("path", "")):
+            raw_payload = extract_data(**kwargs) or {}
+        if not raw_payload.get("path"):
+            raise ValueError("No raw data path available to build processed dataset.")
+
+        df = pd.read_csv(raw_payload["path"])
+
+        for transform in CONFIG.get("transformations", []):
+            df = apply_select_expr(df, transform.get("select_expr", ["*"]))
+
+        for rename in CONFIG.get("rename_columns", []):
+            if rename.get("from") in df.columns:
+                df = df.rename(columns={rename["from"]: rename["to"]})
+
+        for replace in CONFIG.get("replace_values", []):
+            columns = replace.get("columns")
+            if columns:
+                df.loc[:, columns] = df.loc[:, columns].replace(replace["old"], replace["new"])
+            else:
+                df = df.replace(replace["old"], replace["new"])
+
+        data_dump = Variable.get(
+            "data_dump", default_var=os.path.join(os.getcwd(), "data_dumps")
+        )
+        target_conn_id = clean_string(CONFIG["target"]["target_db_conn_id"])
+        processed_path = (
+            f"{data_dump}/csv/{target_conn_id}/{dag_name}/{kwargs['run_id']}/processed.csv"
+        )
+        os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+        df.to_csv(processed_path, index=False)
+        payload = {"path": processed_path, "schema": json.dumps({"columns": df.columns.tolist()})}
+
+    target_hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+    target_engine = create_engine(target_hook.get_uri())
+    ensure_schema_exists(CONFIG["target"]["target_table_schema"])
+    # Guarantee metadata columns exist before the first write (handles pre-existing tables).
+    # create_target already called this, but run again here in case load_data is
+    # retried in isolation or create_target was bypassed.
+    _ensure_pipeline_metadata_columns(
+        CONFIG["target"]["target_table_schema"],
+        CONFIG["target"]["target_table_name"],
+    )
+
+    chunk_size = CONFIG.get("read_chunk_size")
+    chunks = pd.read_csv(payload["path"], chunksize=chunk_size)
+    run_id    = kwargs.get("run_id") or (kwargs["dag_run"].run_id if kwargs.get("dag_run") else "")
+    dag_run   = kwargs.get("dag_run")
+    _now      = datetime.utcnow()
+    first_chunk = True
+    for chunk in chunks:
+        if chunk.empty:
+            continue
+
+        # ── Pipeline metadata columns ────────────────────────────────────
+        data_cols = list(chunk.columns)
+        chunk["_row_checksum"] = (
+            chunk[data_cols]
+            .astype(str)
+            .apply(lambda r: hashlib.md5("|".join(r).encode("utf-8")).hexdigest(), axis=1)
+        )
+        chunk.insert(0, "_pipeline_inserted_at", _now)
+        chunk.insert(1, "_pipeline_run_id",      run_id)
+        chunk.insert(2, "_source_system",         CONFIG["dag_id"])
+        chunk.insert(3, "_loaded_at",             _now)
+        # _row_checksum already appended at end
+
+        dtypes = build_sqlalchemy_dtypes(chunk)
+        if_exists_mode = CONFIG.get("write_mode", "append") if first_chunk else "append"
+        chunk.to_sql(
+            name=CONFIG["target"]["target_table_name"],
+            schema=CONFIG["target"]["target_table_schema"],
+            con=target_engine,
+            if_exists=if_exists_mode,
+            index=False,
+            chunksize=10000,
+            method="multi",
+            dtype=dtypes,
+        )
+        first_chunk = False
+
+
+def cleanup(**kwargs):
+    payload = kwargs["ti"].xcom_pull(task_ids="process_data") or {}
+    raw_payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+    for item in [payload.get("path"), raw_payload.get("path")]:
+        if item:
+            os.system(f"rm -f {item}")
+
+
+def collect_metrics_fn(**kwargs):
+    """
+    Write one row to pipeline.etl_metrics after every DAG run.
+    Computes:
+      - run_id                : Airflow run_id for traceability
+      - run_start / run_end   : when the DAG run actually started and when metrics were collected
+      - run_duration_secs     : wall-clock seconds from DAG run start to now
+      - run_status            : 'success' always here (errors set it to 'failed' in the except)
+      - error_msg             : populated if an upstream task failed (from XCom or task state)
+      - rows_loaded_now       : from XCom (this run)
+      - batch_size            : configured batch_size from CONFIG
+      - target_total_records  : COUNT(*) on target table
+      - target_today_records  : rows loaded today (incremental_column date = today)
+      - target_max/first_upload_date : MAX/MIN of incremental_column in target
+      - source_total_records  : COUNT(*) on source table
+      - source_loaded_to_max_target : rows at source with incremental <= target max
+      - perc_loaded           : source_loaded_to_max_target / source_total * 100
+    """
+    from airflow.utils import timezone
+
+    ti = kwargs["ti"]
+    dag_run = kwargs["dag_run"]
+    env = Variable.get("environment", "dev")
+
+    # --- run timing ---------------------------------------------------------
+    run_id    = dag_run.run_id
+    run_start = dag_run.start_date          # when Airflow scheduled this run
+    run_end   = timezone.utcnow()           # now = when collect_metrics executes
+    run_duration_secs = (
+        int((run_end - run_start).total_seconds()) if run_start else None
+    )
+
+    # --- detect upstream failures (load task state) -------------------------
+    run_status = "success"
+    error_msg  = None
+    try:
+        load_ti = dag_run.get_task_instance("load_data")
+        no_new_ti = dag_run.get_task_instance("no_new_rows")
+
+        if no_new_ti and no_new_ti.state == "success":
+            # Branch took the no_new_rows path — nothing to load this run
+            run_status = "no_new_rows"
+        elif load_ti and load_ti.state not in ("success", "skipped", None):
+            run_status = "failed"
+            error_msg  = f"load_data task state: {load_ti.state}"
+    except Exception:
+        pass
+
+    # --- row counts from this run (XCom, no extra query needed) -------------
+    extract_payload = ti.xcom_pull(task_ids="extract_data") or {}
+    rows_loaded_now = extract_payload.get("row_count", 0) or 0
+    # Guarantee zero on the no_new_rows path (XCom already returns 0, being explicit)
+    if run_status == "no_new_rows":
+        rows_loaded_now = 0
+
+    # --- batch_size from config (how many rows per batch were configured) ---
+    batch_size = CONFIG["source"].get("batch_size") or None
+
+    # --- target stats -------------------------------------------------------
+    target_hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    target_schema = CONFIG["target"]["target_table_schema"]
+    target_table  = CONFIG["target"]["target_table_name"]
+    incr_col      = CONFIG["source"]["incremental_column"]
+    incr_datatype = (CONFIG["source"].get("incremental_column_datatype") or "").lower()
+    is_numeric    = incr_datatype in ("int", "bigint")
+
+    target_total = target_today = None
+    target_max_upload = target_first_upload = target_max_incr = None
+
+    try:
+        target_total = (target_hook.get_first(
+            f"SELECT COUNT(*) FROM {target_schema}.{target_table}"
+        ) or [0])[0]
+
+        if incr_col:
+            if is_numeric:
+                target_today_sql = (
+                    f"SELECT COUNT(*) FROM {target_schema}.{target_table} "
+                    f"WHERE CAST({incr_col} AS BIGINT) > 0"
+                )
+            else:
+                target_today_sql = (
+                    f"SELECT COUNT(*) FROM {target_schema}.{target_table} "
+                    f"WHERE DATE(CAST({incr_col} AS TIMESTAMP)) = CURRENT_DATE"
+                )
+            target_today = (target_hook.get_first(target_today_sql) or [0])[0]
+
+            target_max_incr_raw = (target_hook.get_first(
+                f"SELECT MAX({incr_col}) FROM {target_schema}.{target_table}"
+            ) or [None])[0]
+            target_max_incr = str(target_max_incr_raw) if target_max_incr_raw is not None else None
+
+            if not is_numeric:
+                target_max_upload = (target_hook.get_first(
+                    f"SELECT MAX(CAST({incr_col} AS TIMESTAMP)) FROM {target_schema}.{target_table}"
+                ) or [None])[0]
+                target_first_upload = (target_hook.get_first(
+                    f"SELECT MIN(CAST({incr_col} AS TIMESTAMP)) FROM {target_schema}.{target_table}"
+                ) or [None])[0]
+
+    except Exception as e:
+        logging.warning("collect_metrics: could not query target stats: %s", e)
+
+    # --- source stats + coverage calculation --------------------------------
+    source_total = source_loaded_to_max_target = source_max_incr = None
+
+    try:
+        source_hook       = get_hook(CONFIG["source"]["source_db_conn_id"])
+        source_schema     = CONFIG["source"]["source_table_schema"]
+        source_table_name = CONFIG["source"]["source_table_name"]
+
+        # Build the FROM clause: prefer explicit table name, fall back to SQL file as subquery
+        if source_schema and source_table_name:
+            from_clause  = f"{source_schema}.{source_table_name}"
+            use_subquery = False
+        else:
+            # No explicit table — wrap the SQL file query as a subquery
+            _base_sql    = parse_sql_file(SQL_PATH)
+            from_clause  = f"({_base_sql}) _src"
+            use_subquery = True
+
+        source_total = (source_hook.get_first(
+            f"SELECT COUNT(*) FROM {from_clause}"
+        ) or [None])[0]
+
+        if incr_col:
+            source_max_incr_raw = (source_hook.get_first(
+                f"SELECT MAX({incr_col}) FROM {from_clause}"
+            ) or [None])[0]
+            source_max_incr = str(source_max_incr_raw) if source_max_incr_raw is not None else None
+
+            # How many source rows are covered up to the target's current max?
+            if target_max_incr is not None:
+                if is_numeric:
+                    coverage_sql = (
+                        f"SELECT COUNT(*) FROM {from_clause} "
+                        f"WHERE CAST({incr_col} AS BIGINT) <= {target_max_incr}"
+                    )
+                else:
+                    coverage_sql = (
+                        f"SELECT COUNT(*) FROM {from_clause} "
+                        f"WHERE CAST({incr_col} AS TIMESTAMP) <= '{target_max_incr}'"
+                    )
+                source_loaded_to_max_target = (source_hook.get_first(coverage_sql) or [None])[0]
+
+    except Exception as e:
+        logging.warning("collect_metrics: could not query source stats: %s", e)
+
+    # --- perc_loaded: % of source rows covered in target --------------------
+    perc_loaded = None
+    if source_total and source_loaded_to_max_target is not None:
+        perc_loaded = round((source_loaded_to_max_target / source_total) * 100, 2)
+    elif source_total and target_total:
+        perc_loaded = round((target_total / source_total) * 100, 2)
+
+    # --- write to pipeline.etl_metrics -------------------------------------
+    metrics_conn_id = Variable.get("metrics_db_conn_id", default_var=CONFIG["target"]["target_db_conn_id"])
+    metrics_hook    = get_hook(metrics_conn_id)
+    metrics_engine  = create_engine(metrics_hook.get_uri())
+
+    # Auto-create schema + table on first use (idempotent)
+    with metrics_engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id                          SERIAL PRIMARY KEY,
+                dag_id                      TEXT,
+                env                         TEXT,
+                schema                      TEXT,
+                table_name                  TEXT,
+                run_id                      TEXT,
+                run_start                   TIMESTAMP WITH TIME ZONE,
+                run_end                     TIMESTAMP WITH TIME ZONE,
+                run_duration_secs           INTEGER,
+                run_status                  TEXT NOT NULL DEFAULT 'success',
+                error_msg                   TEXT,
+                batch_size                  INTEGER,
+                rows_loaded_now             BIGINT,
+                target_total_records        BIGINT,
+                target_today_records        BIGINT,
+                target_max_upload_date      TIMESTAMP,
+                target_first_upload_date    TIMESTAMP,
+                target_max_incremental      TEXT,
+                source_total_records        BIGINT,
+                source_max_incremental      TEXT,
+                source_loaded_to_max_target BIGINT,
+                perc_loaded                 NUMERIC(6,2),
+                engine_type                 TEXT DEFAULT 'pandas',
+                created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        # Schema migrations — add columns that may be missing from older table versions
+        migrations = [
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'db'",
+        ]
+        for migration in migrations:
+            conn.execute(text(migration))
+
+    with metrics_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name,
+                run_id, run_start, run_end, run_duration_secs,
+                run_status, error_msg, batch_size,
+                rows_loaded_now,
+                target_total_records, target_today_records,
+                target_max_upload_date, target_first_upload_date,
+                target_max_incremental,
+                source_total_records, source_max_incremental,
+                source_loaded_to_max_target,
+                perc_loaded,
+                source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name,
+                :run_id, :run_start, :run_end, :run_duration_secs,
+                :run_status, :error_msg, :batch_size,
+                :rows_loaded_now,
+                :target_total, :target_today,
+                :target_max_upload, :target_first_upload,
+                :target_max_incr,
+                :source_total, :source_max_incr,
+                :source_loaded_to_max_target,
+                :perc_loaded,
+                'db'
+            )
+        """), {
+            "dag_id":                      CONFIG["dag_id"],
+            "env":                         env,
+            "schema":                      CONFIG["source"].get("source_table_schema"),
+            "table_name":                  target_table,
+            "run_id":                      run_id,
+            "run_start":                   run_start,
+            "run_end":                     run_end,
+            "run_duration_secs":           run_duration_secs,
+            "run_status":                  run_status,
+            "error_msg":                   error_msg,
+            "batch_size":                  batch_size,
+            "rows_loaded_now":             rows_loaded_now,
+            "target_total":                target_total,
+            "target_today":                target_today,
+            "target_max_upload":           target_max_upload,
+            "target_first_upload":         target_first_upload,
+            "target_max_incr":             target_max_incr,
+            "source_total":                source_total,
+            "source_max_incr":             source_max_incr,
+            "source_loaded_to_max_target": source_loaded_to_max_target,
+            "perc_loaded":                 perc_loaded,
+        })
+    logging.info(
+        "collect_metrics: %s.%s | run_id=%s | duration=%ss | status=%s | "
+        "this_run=%s | target=%s | source=%s | covered=%s | perc=%.1f%%",
+        target_schema, target_table, run_id, run_duration_secs, run_status,
+        rows_loaded_now, target_total, source_total,
+        source_loaded_to_max_target, perc_loaded or 0,
+    )
+
+
+extract_task = PythonOperator(
+    task_id="extract_data",
+    python_callable=extract_data,
+    provide_context=True,
+    dag=dag,
+)
+
+branch_task = BranchPythonOperator(
+    task_id="branch_on_rows",
+    python_callable=branch_on_rows,
+    provide_context=True,
+    dag=dag,
+)
+
+process_task = PythonOperator(
+    task_id="process_data",
+    python_callable=process_data,
+    provide_context=True,
+    dag=dag,
+)
+
+create_target_task = PythonOperator(
+    task_id="create_target",
+    python_callable=create_target,
+    provide_context=True,
+    dag=dag,
+)
+
+load_task = PythonOperator(
+    task_id="load_data",
+    python_callable=load_data,
+    provide_context=True,
+    dag=dag,
+)
+
+cleanup_task = PythonOperator(
+    task_id="cleanup",
+    python_callable=cleanup,
+    provide_context=True,
+    trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    dag=dag,
+)
+
+no_new_rows = EmptyOperator(task_id="no_new_rows", dag=dag)
+collect_metrics_task = PythonOperator(
+    task_id="collect_metrics",
+    python_callable=collect_metrics_fn,
+    provide_context=True,
+    trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    dag=dag,
+)
+
+start >> create_target_task >> extract_task >> branch_task
+branch_task >> no_new_rows >> collect_metrics_task >> end
+branch_task >> process_task >> load_task >> cleanup_task >> collect_metrics_task >> end

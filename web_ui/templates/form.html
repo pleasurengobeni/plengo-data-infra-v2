@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ 'Edit' if config else 'New' }} ETL Job</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  <style>
+    .env-banner { display:flex; align-items:center; gap:8px; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; margin-bottom:14px; }
+    .env-banner.dev  { background:#dcfce7; color:#15803d; border:1px solid #86efac; }
+    .env-banner.prod { background:#fef9c3; color:#92400e; border:1px solid #fde68a; }
+    .env-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .env-banner.dev  .env-dot { background:#22c55e; }
+    .env-banner.prod .env-dot { background:#f59e0b; }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}">&#9654; ETL Manager</a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>{{ 'Edit Job' if config else 'Add a New Job' }}</h1>
+    </div>
+
+    {# ── Environment banner ── #}
+    {% if active_env == 'dev' %}
+    <div class="env-banner dev"><span class="env-dot"></span> Editing <strong>DEV</strong> environment only &mdash; prod fields are preserved from the saved config.</div>
+    {% elif active_env == 'prod' %}
+    <div class="env-banner prod"><span class="env-dot"></span> Editing <strong>PROD</strong> environment only &mdash; dev fields are preserved from the saved config.</div>
+    {% endif %}
+
+    <form method="post" id="jobForm">
+
+      {# ── When env-scoped: carry over the OTHER env's fields as hidden inputs so they are not lost on save ── #}
+      {% if config and config.spark and not (active_env == '') %}
+        {# Preserve existing spark config when form is submitted without touching the Spark panel #}
+        <input type="hidden" name="_existing_spark_master"           value="{{ config.spark.master or 'local[*]' }}" />
+        <input type="hidden" name="_existing_spark_app_name"         value="{{ config.spark.app_name or '' }}" />
+        <input type="hidden" name="_existing_spark_driver_memory"    value="{{ config.spark.driver_memory or '1g' }}" />
+        <input type="hidden" name="_existing_spark_executor_memory"  value="{{ config.spark.executor_memory or '2g' }}" />
+        <input type="hidden" name="_existing_spark_executor_cores"   value="{{ config.spark.executor_cores or 2 }}" />
+        <input type="hidden" name="_existing_spark_num_executors"    value="{{ config.spark.num_executors or 2 }}" />
+      {% endif %}
+
+      {% if active_env == 'dev' and config %}
+        <input type="hidden" name="prod_source_db_conn_id"  value="{{ config.source.prod.source_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_source_db_type"     value="{{ config.source.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_hwm_column"         value="{{ config.source.prod.incremental_column or '' }}" />
+        <input type="hidden" name="prod_hwm_datatype"       value="{{ config.source.prod.incremental_column_datatype or 'timestamp' }}" />
+        <input type="hidden" name="prod_batch_size"         value="{{ config.source.prod.batch_size or 0 }}" />
+        <input type="hidden" name="prod_target_db_conn_id"  value="{{ config.target.prod.target_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_target_db_type"     value="{{ config.target.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_target_schema"      value="{{ config.target.prod.target_schema or '' }}" />
+        <input type="hidden" name="prod_target_table"       value="{{ config.target.prod.target_table or '' }}" />
+        <input type="hidden" name="prod_target_hwm_column"  value="{{ config.target.prod.hwm_column or '' }}" />
+        <input type="hidden" name="prod_load_strategy"      value="{{ config.target.prod.load_strategy or 'append' }}" />
+        <input type="hidden" name="prod_sql_text"           value="{{ prod_sql_text or '' }}" />
+      {% elif active_env == 'prod' and config %}
+        <input type="hidden" name="dev_source_db_conn_id"   value="{{ config.source.dev.source_db_conn_id or '' }}" />
+        <input type="hidden" name="dev_source_db_type"      value="{{ config.source.dev.db_type or 'postgresql' }}" />
+        <input type="hidden" name="dev_hwm_column"          value="{{ config.source.dev.incremental_column or '' }}" />
+        <input type="hidden" name="dev_hwm_datatype"        value="{{ config.source.dev.incremental_column_datatype or 'timestamp' }}" />
+        <input type="hidden" name="dev_batch_size"          value="{{ config.source.dev.batch_size or 0 }}" />
+        <input type="hidden" name="dev_target_db_conn_id"   value="{{ config.target.dev.target_db_conn_id or '' }}" />
+        <input type="hidden" name="dev_target_db_type"      value="{{ config.target.dev.db_type or 'postgresql' }}" />
+        <input type="hidden" name="dev_target_schema"       value="{{ config.target.dev.target_schema or '' }}" />
+        <input type="hidden" name="dev_target_table"        value="{{ config.target.dev.target_table or '' }}" />
+        <input type="hidden" name="dev_target_hwm_column"   value="{{ config.target.dev.hwm_column or '' }}" />
+        <input type="hidden" name="dev_load_strategy"       value="{{ config.target.dev.load_strategy or 'append' }}" />
+        <input type="hidden" name="dev_sql_text"            value="{{ dev_sql_text or '' }}" />
+      {% endif %}
+
+      <!-- Step Tabs -->
+      <div class="step-tabs" id="stepTabs">
+        <div class="step-tab active" data-idx="0">1. Basics</div>
+        <div class="step-tab"        data-idx="1">2. Source</div>
+        <div class="step-tab"        data-idx="2">3. Target</div>
+        <div class="step-tab"        data-idx="3">4. Review</div>
+      </div>
+
+      <!-- ── STEP 1: Basics ── -->
+      <div class="card form-step" data-step="0">
+        <div class="card-title">Job Basics</div>
+        <div class="form-grid">
+
+          <div class="form-field">
+            <label>DAG ID *</label>
+            <input name="dag_id" value="{{ config.dag_id if config else '' }}" required placeholder="e.g. cenfri_entity_sales" />
+          </div>
+
+          <div class="form-field">
+            <label>Schedule — pick preset</label>
+            <select id="schedulePicker">
+              <option value="">— select a preset —</option>
+              {% for lbl, cron in schedule_suggestions %}
+              <option value="{{ cron }}">{{ lbl }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule Interval (cron)</label>
+            <input id="scheduleInterval" name="schedule_interval"
+                   value="{{ config.schedule_interval if config else '0 2 * * *' }}"
+                   placeholder="0 2 * * *" />
+          </div>
+
+          <div class="form-field span-2">
+            <label>Additional Tags (comma-separated)</label>
+            <input name="extra_tags"
+                   value="{{ extra_tags_str if extra_tags_str is defined else '' }}"
+                   placeholder="e.g. finance, daily, cenfri" />
+            <span class="field-hint">Your username is always included automatically.</span>
+          </div>
+
+          <div class="form-field" style="display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:6px;">
+            <label>Current Tags</label>
+            <div class="tags-row">
+              {% if current_username %}<span class="tag tag-owner">{{ current_username }}</span>{% endif %}
+              {% for t in existing_tags[1:] %}<span class="tag">{{ t }}</span>{% endfor %}
+            </div>
+          </div>
+
+          <input type="hidden" name="created_by" value="{{ current_username }}" />
+
+        </div>
+
+        {# "Same as dev" toggle only shown when both envs are editable #}
+        {% if active_env %}
+        {# Single-env mode: prod config always mirrors dev — send "on" so backend doesn't look for absent prod fields #}
+        <input type="hidden" name="apply_prod_same_as_dev" value="on" />
+        {% else %}
+        <div class="toggle-field">
+          <label class="toggle-switch">
+            <input type="checkbox" name="apply_prod_same_as_dev" id="sameAsDev" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="sameAsDev">Use same settings for Prod as Dev</label>
+        </div>
+        {% endif %}
+
+        {# ── Spark engine toggle ── #}
+        <div class="toggle-field" style="margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="use_spark" id="useSpark"
+                   {% if config and config.spark %}checked{% endif %} />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="useSpark" style="font-weight:600;">
+            &#9889; Run on <strong>Spark</strong>
+            <span style="font-weight:400;color:#6b7a90;font-size:11px;margin-left:6px;">— uses PySpark JDBC instead of Pandas</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- ── STEP 2: Source ── -->
+      <div class="card form-step" data-step="1">
+        <div class="card-title">Source Configuration</div>
+
+        {# ── Spark configuration panel (shown only when Spark toggle is on) ── #}
+        <div id="sparkConfigPanel" style="display:none;background:#f0f7ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px;margin-bottom:20px;">
+          <div style="font-weight:600;color:#1e40af;margin-bottom:12px;">&#9889; Spark Configuration</div>
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Spark Master</label>
+              <input name="spark_master" value="{{ config.spark.master if config and config.spark else 'local[*]' }}" placeholder="local[*] or spark://host:7077" />
+              <span class="field-hint">local[*] for local mode; spark://host:7077 for cluster</span>
+            </div>
+            <div class="form-field">
+              <label>App Name</label>
+              <input name="spark_app_name" value="{{ config.spark.app_name if config and config.spark else '' }}" placeholder="my_etl_job" />
+            </div>
+            <div class="form-field">
+              <label>Driver Memory</label>
+              <input name="spark_driver_memory" value="{{ config.spark.driver_memory if config and config.spark else '1g' }}" placeholder="1g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Memory</label>
+              <input name="spark_executor_memory" value="{{ config.spark.executor_memory if config and config.spark else '2g' }}" placeholder="2g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Cores</label>
+              <input name="spark_executor_cores" type="number" min="1" value="{{ config.spark.executor_cores if config and config.spark else 2 }}" />
+            </div>
+            <div class="form-field">
+              <label>Num Executors</label>
+              <input name="spark_num_executors" type="number" min="1" value="{{ config.spark.num_executors if config and config.spark else 2 }}" />
+            </div>
+          </div>
+        </div>
+
+        <div class="form-grid">
+
+          {# ── DEV source — shown when env is dev or both ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Source — Dev</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="dev_source_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.source.dev.source_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_source_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.source.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="dev_hwm_column" value="{{ config.source.dev.incremental_column if config else '' }}" placeholder="e.g. updated_at" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Datatype</label>
+            <select name="dev_hwm_datatype">
+              {% for dt in ['timestamp','int','bigint'] %}
+              <option value="{{ dt }}" {% if config and config.source.dev.incremental_column_datatype == dt %}selected{% endif %}>{{ dt }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Batch Size</label>
+            <input name="dev_batch_size" value="{{ config.source.dev.batch_size if config else 0 }}" />
+          </div>
+
+          <div class="form-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="dev_full_load" {% if config and config.source.dev.full_load %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label>Full Load</label>
+            </div>
+          </div>
+
+          <div class="form-field span-3">
+            <label>SQL Query (Dev)</label>
+            <textarea name="dev_sql_text" rows="8" placeholder="SELECT * FROM schema.table WHERE ...">{{ dev_sql_text or '' }}</textarea>
+          </div>
+          {% endif %}
+
+          {# ── PROD source — shown when env is prod or both ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Source — Prod</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="prod_source_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.source.prod.source_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_source_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.source.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="prod_hwm_column" value="{{ config.source.prod.incremental_column if config else '' }}" placeholder="e.g. updated_at" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Datatype</label>
+            <select name="prod_hwm_datatype">
+              {% for dt in ['timestamp','int','bigint'] %}
+              <option value="{{ dt }}" {% if config and config.source.prod.incremental_column_datatype == dt %}selected{% endif %}>{{ dt }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Batch Size</label>
+            <input name="prod_batch_size" value="{{ config.source.prod.batch_size if config else 0 }}" />
+          </div>
+
+          <div class="form-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="prod_full_load" {% if config and config.source.prod.full_load %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label>Full Load</label>
+            </div>
+          </div>
+
+          <div class="form-field span-3">
+            <label>SQL Query (Prod)</label>
+            <textarea name="prod_sql_text" rows="8" placeholder="SELECT * FROM schema.table WHERE ...">{{ prod_sql_text or '' }}</textarea>
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 3: Target ── -->
+      <div class="card form-step" data-step="2">
+        <div class="card-title">Target Configuration</div>
+        <div class="form-grid">
+
+          {# ── DEV target ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Target — Dev</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="dev_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.dev.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Load Strategy</label>
+            <select name="dev_load_strategy">
+              {% for ls in ['append','replace'] %}
+              <option value="{{ ls }}" {% if config and config.target.dev.load_strategy == ls %}selected{% endif %}>{{ ls }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Target Schema</label>
+            <input name="dev_target_schema" value="{{ config.target.dev.target_schema if config else '' }}" placeholder="e.g. public" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table</label>
+            <input name="dev_target_table" value="{{ config.target.dev.target_table if config else '' }}" placeholder="e.g. entity_sales" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="dev_target_hwm_column" value="{{ config.target.dev.hwm_column if config else '' }}" />
+          </div>
+          {% endif %}
+
+          {# ── PROD target ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Target — Prod</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="prod_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.prod.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Load Strategy</label>
+            <select name="prod_load_strategy">
+              {% for ls in ['append','replace'] %}
+              <option value="{{ ls }}" {% if config and config.target.prod.load_strategy == ls %}selected{% endif %}>{{ ls }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Target Schema</label>
+            <input name="prod_target_schema" value="{{ config.target.prod.target_schema if config else '' }}" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table</label>
+            <input name="prod_target_table" value="{{ config.target.prod.target_table if config else '' }}" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="prod_target_hwm_column" value="{{ config.target.prod.hwm_column if config else '' }}" />
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 4: Review ── -->
+      <div class="card form-step" data-step="3">
+        <div class="card-title">Review &amp; Save</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:12px;">Review your settings across all steps, then click <strong>Save</strong>.</p>
+        <div id="reviewSummary" style="font-size:12px;line-height:1.8;color:#444;"></div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="form-actions">
+        <button class="btn btn-secondary" type="button" id="prevBtn">&#8592; Back</button>
+        <button class="btn btn-primary"   type="button" id="nextBtn">Next &#8594;</button>
+        <button class="btn btn-primary"   type="submit"  id="saveBtn">&#10003; Save</button>
+        <a      class="btn btn-secondary" href="{{ url_for('jobs') }}">&#10005; Cancel</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="footer">Developed by <a href="https://cenfri.org" target="_blank">Cenfri.org</a> &mdash; <a href="mailto:datateam@cenfri.org">datateam@cenfri.org</a></div>
+</div>
+
+<script>
+  const steps     = Array.from(document.querySelectorAll('.form-step'));
+  const tabs      = Array.from(document.querySelectorAll('.step-tab'));
+  const nextBtn   = document.getElementById('nextBtn');
+  const prevBtn   = document.getElementById('prevBtn');
+  const saveBtn   = document.getElementById('saveBtn');
+  let current = 0;
+
+  function renderStep() {
+    steps.forEach((s, i) => s.style.display = i === current ? 'block' : 'none');
+    tabs.forEach((t, i)  => t.classList.toggle('active', i === current));
+    prevBtn.style.display = current === 0 ? 'none' : 'inline-flex';
+    nextBtn.style.display = current === steps.length - 1 ? 'none' : 'inline-flex';
+    saveBtn.style.display = current === steps.length - 1 ? 'inline-flex' : 'none';
+    if (current === steps.length - 1) buildReview();
+  }
+
+  function buildReview() {
+    const dagId = document.querySelector('[name=dag_id]').value;
+    const sched = document.getElementById('scheduleInterval').value;
+    const tags  = (document.querySelector('[name=created_by]').value +
+                  (document.querySelector('[name=extra_tags]').value ? ', ' + document.querySelector('[name=extra_tags]').value : ''));
+    const activeEnv = '{{ active_env or "both" }}';
+    const devConn  = document.querySelector('[name=dev_source_db_conn_id]');
+    const prodConn = document.querySelector('[name=prod_source_db_conn_id]');
+    document.getElementById('reviewSummary').innerHTML =
+      '<b>DAG ID:</b> ' + (dagId||'—') + '<br>' +
+      '<b>Schedule:</b> ' + (sched||'—') + '<br>' +
+      '<b>Environment:</b> ' + activeEnv + '<br>' +
+      '<b>Tags:</b> ' + (tags||'—') + '<br>' +
+      (devConn  ? '<b>Source Dev Conn:</b> '  + (devConn.value||'—')  + '<br>' : '') +
+      (prodConn ? '<b>Source Prod Conn:</b> ' + (prodConn.value||'—') + '<br>' : '');
+  }
+
+  tabs.forEach(t => t.addEventListener('click', () => {
+    current = parseInt(t.dataset.idx);
+    renderStep();
+  }));
+
+  nextBtn.addEventListener('click', () => { if (current < steps.length-1) { current++; renderStep(); } });
+  prevBtn.addEventListener('click', () => { if (current > 0) { current--; renderStep(); } });
+
+  // Schedule picker → sync to cron input
+  const picker = document.getElementById('schedulePicker');
+  const schedInp = document.getElementById('scheduleInterval');
+  if (picker && schedInp) {
+    Array.from(picker.options).forEach(o => { if (o.value === schedInp.value) picker.value = o.value; });
+    picker.addEventListener('change', () => { if (picker.value) schedInp.value = picker.value; });
+  }
+
+  // Spark toggle → show/hide Spark config panel
+  const sparkToggle = document.getElementById('useSpark');
+  const sparkPanel  = document.getElementById('sparkConfigPanel');
+  function syncSparkPanel() {
+    if (!sparkPanel) return;
+    sparkPanel.style.display = sparkToggle && sparkToggle.checked ? 'block' : 'none';
+  }
+  if (sparkToggle) { sparkToggle.addEventListener('change', syncSparkPanel); syncSparkPanel(); }
+
+  renderStep();
+</script>
+</body>
+</html>
