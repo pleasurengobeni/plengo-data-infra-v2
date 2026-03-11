@@ -1,4 +1,4 @@
-# Linux Installation Guide — plengo-data-infra-v2
+# Linux Installation Guide — plengo_data-infra-v2
 
 Step-by-step guide to install and run the full ETL stack on a fresh **Ubuntu 24.04 LTS** server.
 
@@ -24,7 +24,7 @@ Step-by-step guide to install and run the full ETL stack on a fresh **Ubuntu 24.
 - 2 CPU cores minimum
 - 20 GB disk space
 - Internet access (to pull Docker images and JDBC drivers)
-- GitHub account with access to `pleasurengobeni/plengo-data-infra-v2`
+- GitHub account with access to `pleasurengobeni/plengo_data-infra-v2`
 
 ---
 
@@ -108,7 +108,7 @@ ssh -T git@github.com
 ```bash
 # Make sure you are inside ~/datapipeline/airflow
 cd ~/datapipeline/airflow
-git clone git@github.com:pleasurengobeni/plengo-data-infra-v2.git .
+git clone git@github.com:pleasurengobeni/plengo_data-infra-v2.git .
 ```
 
 ---
@@ -337,7 +337,7 @@ docker exec -u root jenkins bash -c "
 ### 11.3 Generate a dedicated deploy key
 
 ```bash
-ssh-keygen -t ed25519 -C "jenkins-deploy@wasac" -f ~/.ssh/jenkins_deploy -N ""
+ssh-keygen -t ed25519 -C "jenkins-deploy@plengo" -f ~/.ssh/jenkins_deploy -N ""
 cat ~/.ssh/jenkins_deploy.pub   # copy this — add to GitHub Deploy Keys
 ```
 

@@ -1,6 +1,6 @@
 # plengo-data-infra-v2
 
-ETL pipeline platform and analytics dashboards for WASAC data monitoring and decision-making.  
+ETL pipeline platform and analytics dashboards for Plengo data monitoring and decision-making.  
 Built on **Apache Airflow 2.6**, **PostgreSQL**, **Redis (Celery)**, and a lightweight **Flask Web UI**.
 
 ---
@@ -163,7 +163,7 @@ docker exec -u root jenkins bash -c "
 #### 8.3 Generate a dedicated deploy SSH key
 
 ```bash
-ssh-keygen -t ed25519 -C "jenkins-deploy@wasac" -f ~/.ssh/jenkins_deploy -N ""
+ssh-keygen -t ed25519 -C "jenkins-deploy@plengo" -f ~/.ssh/jenkins_deploy -N ""
 ```
 
 Add an SSH config entry so git on the server uses this key for GitHub:
@@ -504,7 +504,7 @@ Web UI (form submit)
 ## Project Structure
 
 ```
-plengo-data-infra-v2/
+plengo_data-infra-v2/
 ├── dags/
 │   ├── config/          ← ETL job configs (JSON) — managed by Web UI
 │   ├── sql/             ← SQL query files (one per job per env)
@@ -854,10 +854,8 @@ Never commit directly to `main`. Always work on a feature branch.
 - Click **Publish branch** (first time) or **Push origin**
 
 #### 6. Open a Pull Request
-- GitHub Desktop will show a banner → click **Create Pull Request**
-- Or go to **github.com → WASACIT/wasac_analytics → Pull requests → New pull request**
+- Or go to **github.com → pleasurengobeni/plengo_data-infra-v2 → Pull requests → New pull request**
   - Base: `main` ← Compare: `feature/your-branch-name`
-- Add a title and description → **Create pull request**
 
 #### 7. Wait for approval
 - At least **1 team member must approve** before the PR can be merged
@@ -875,10 +873,7 @@ Never commit directly to `main`. Always work on a feature branch.
 Protects `main` from direct pushes, force pushes, deletions, and unreviewed merges.
 
 **Step 1 — Open branch rules**
-- Go to **https://github.com/WASACIT/wasac_analytics**
-- Click **Settings** (top tab)
-- In the left sidebar click **Rules** → **Rulesets**
-- Click **New ruleset** → **New branch ruleset**
+- Go to **https://github.com/pleasurengobeni/plengo_data-infra-v2**
 
 **Step 2 — Name and activate**
 | Field | Value |
